@@ -15,6 +15,16 @@ on:
         description: 'The model to use'
         required: true
         type: string
+      extra_instructions:
+        description: 'Additional prompt instructions appended after the base instructions (applies to both @codex and @chat).'
+        required: false
+        type: string
+        default: ''
+      extra_common_instructions:
+        description: 'Additional prompt instructions appended after the common instructions block (applies to both @codex and @chat).'
+        required: false
+        type: string
+        default: ''
     secrets:
       CODEX_GITHUB_APP_ID:
         required: true
@@ -22,6 +32,10 @@ on:
         required: true
       CODEX_GH_TOKEN:
         required: true
+      INTERCOM_ACCESS_TOKEN:
+        required: false
+      AIRTABLE_TASKS_PAT:
+        required: false
 
 jobs:
   codex:
@@ -1129,6 +1143,8 @@ jobs:
           ACTIVE_PR_URL: ${{ steps.branch.outputs.active_pr_url }}
           COMMENTS_TEXT: ${{ steps.comments.outputs.comments_text }}
           CODEX_GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
+          EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
+          EXTRA_COMMON_INSTRUCTIONS: ${{ inputs.extra_common_instructions }}
         run: |
           python3 - <<'PY'
           import json
@@ -1145,6 +1161,17 @@ jobs:
           active_pr_url = os.environ.get("ACTIVE_PR_URL", "").strip()
           workspace = os.environ.get("GITHUB_WORKSPACE", "")
           github_token = os.environ.get("CODEX_GH_TOKEN", "").strip()
+          extra_instructions = os.environ.get("EXTRA_INSTRUCTIONS", "").strip()
+          extra_common_instructions = os.environ.get("EXTRA_COMMON_INSTRUCTIONS", "").strip()
+
+          def append_instruction_block(base, extra):
+            extra = (extra or "").strip()
+            if not extra:
+              return base
+            extra = textwrap.dedent(extra).strip()
+            if not extra:
+              return base
+            return base + "\n" + extra
 
           with open(event_path, "r", encoding="utf-8") as handle:
             event = json.load(handle)
@@ -1208,7 +1235,6 @@ jobs:
             f"""\
             * I use voice dictation; expect typos and confirm if ambiguous.
             * Don't guess & assume. If you're not sure what I mean, ask me.
-            * Instead of guessing the root cause of an issue, suggest adding debug logs.
             * If implementation intent is unclear, ask a clarifying question instead of editing.
             * You can update issue's description using gh. Do so as needed.
             * Do not make changes to the code. You can chat and analyze the code, GitHub, and workflows.
@@ -1220,8 +1246,6 @@ jobs:
             * I use voice dictation; expect typos and confirm if ambiguous.
             * Don't guess & assume. If you're not sure what I mean, ask me.
             * If implementation intent is unclear, ask a clarifying question instead of editing.
-            * Instead of guessing the root cause of an issue, suggest adding debug logs.
-            * Write AAA production quality well-documented & tested code.
             * Prefer deterministic, pure, functional code, with TDD.
             * Don't write flakey code that can break easily.
             * Refactor & reuse as needed to avoid duplicate code.
@@ -1236,6 +1260,10 @@ jobs:
             * To download attachments, use: `curl -H "Authorization: Bearer {github_token}" -L "<attachment-url>" -o "<filename>"`. Download one file at a time, use the exact format i provided, don't try to create a script to combine downloads or use tmp directories. Stick to a single file with that exact format.
             """
           ).strip()
+
+          chat_instructions = append_instruction_block(chat_instructions, extra_instructions)
+          codex_instructions = append_instruction_block(codex_instructions, extra_instructions)
+          common_instructions = append_instruction_block(common_instructions, extra_common_instructions)
 
           is_chat = trigger_phrase == "@chat"
           selected_instruction = chat_instructions if is_chat else codex_instructions
@@ -1347,6 +1375,8 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           CODEX_GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          INTERCOM_ACCESS_TOKEN: ${{ secrets.INTERCOM_ACCESS_TOKEN }}
+          AIRTABLE_TASKS_PAT: ${{ secrets.AIRTABLE_TASKS_PAT }}
         run: |
           set -euo pipefail
 
