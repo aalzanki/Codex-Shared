@@ -16,6 +16,7 @@ File: `.github/workflows/codex-shared.yml`
 
 - `CODEX_GITHUB_APP_ID` (required)
 - `CODEX_GITHUB_APP_PRIVATE_KEY` (required)
+- `CODEX_GH_TOKEN` (required)
 
 ### Runner Requirements
 

@@ -20,6 +20,8 @@ on:
         required: true
       CODEX_GITHUB_APP_PRIVATE_KEY:
         required: true
+      CODEX_GH_TOKEN:
+        required: true
 
 jobs:
   codex:
@@ -929,6 +931,7 @@ jobs:
           COMMENTS_TEXT: ${{ steps.comments.outputs.comments_text }}
           ISSUE_TITLE: ${{ steps.details.outputs.issue_title }}
           ISSUE_BODY: ${{ steps.details.outputs.issue_body }}
+          CODEX_GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
         run: |
           python3 - <<'PY'
           import json
@@ -945,6 +948,7 @@ jobs:
           active_pr_url = os.environ.get("ACTIVE_PR_URL", "").strip()
           workspace = os.environ.get("GITHUB_WORKSPACE", "")
           issue_title_from_api = os.environ.get("ISSUE_TITLE", "").strip()
+          github_token = os.environ.get("CODEX_GH_TOKEN", "").strip()
           issue_body_from_api = os.environ.get("ISSUE_BODY", "").strip()
 
           with open(event_path, "r", encoding="utf-8") as handle:
@@ -1040,8 +1044,8 @@ jobs:
           ).strip()
 
           common_instructions = textwrap.dedent(
-            """\
-            * To download attachments, use: `curl -H "Authorization: Bearer $GH_TOKEN" -L "<attachment-url>" -o "<filename>"`. Download one file at a time.
+            f"""\
+            * To download attachments, use: `curl -H "Authorization: Bearer {github_token}" -L "<attachment-url>" -o "<filename>"`. Download one file at a time, use the exact format i provided, don't try to create a script to combine downloads or use tmp directories. Stick to a single file with that exact format.
             """
           ).strip()
 
@@ -1282,8 +1286,11 @@ jobs:
           CODEX_WIP_ERROR: ${{ steps.wip_push.outputs.wip_error }}
           JOB_CANCELLED: ${{ job.status == 'cancelled' }}
           ASSISTANT_NAME: ${{ steps.prompt.outputs.assistant_name }}
+          GITHUB_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
+          CODEX_GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
         with:
-          github-token: ${{ steps.app-token.outputs.token }}
+          github-token: ${{ secrets.CODEX_GH_TOKEN }}
           script: |
             const fs = require('fs');
             const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));

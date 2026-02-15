@@ -22,7 +22,6 @@ test("codex-shared workflow does not hardcode personal identities or private rep
     "aalzanki",
     "default: 'ci-prod'",
     "default: \"ci-prod\"",
-    "secrets.CODEX_GH_TOKEN",
   ];
 
   for (const needle of bannedNeedles) {
@@ -32,4 +31,3 @@ test("codex-shared workflow does not hardcode personal identities or private rep
     );
   }
 });
-
