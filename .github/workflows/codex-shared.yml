@@ -1,0 +1,1409 @@
+name: Codex Shared
+
+on:
+  workflow_call:
+    inputs:
+      trigger_phrase:
+        description: 'The phrase that triggers this workflow (e.g., @codex)'
+        required: true
+        type: string
+      runner_group:
+        description: 'GitHub runner group for self-hosted runners'
+        required: true
+        type: string
+      model:
+        description: 'The model to use'
+        required: true
+        type: string
+    secrets:
+      CODEX_GITHUB_APP_ID:
+        required: true
+      CODEX_GITHUB_APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  codex:
+    runs-on:
+      group: ${{ inputs.runner_group }}
+    permissions:
+      actions: write
+      checks: write
+      contents: write
+      deployments: write
+      id-token: write
+      issues: write
+      discussions: write
+      packages: write
+      pages: write
+      pull-requests: write
+      repository-projects: write
+      security-events: write
+      statuses: write
+    steps:
+      - name: Determine target branch
+        id: branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ISSUE_LINKED_PRS_QUERY = `
+              query ResolveIssueLinkedPullRequests(
+                $owner: String!
+                $repo: String!
+                $issueNumber: Int!
+                $linkedPrQueryLimit: Int!
+              ) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $issueNumber) {
+                    closedByPullRequestsReferences(last: $linkedPrQueryLimit) {
+                      nodes {
+                        number
+                        url
+                        state
+                        isCrossRepository
+                        headRefName
+                        createdAt
+                      }
+                    }
+                    timelineItems(
+                      last: $linkedPrQueryLimit
+                      itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]
+                    ) {
+                      nodes {
+                        __typename
+                        ... on CrossReferencedEvent {
+                          source {
+                            ... on PullRequest {
+                              number
+                              url
+                              state
+                              isCrossRepository
+                              headRefName
+                              createdAt
+                            }
+                          }
+                        }
+                        ... on ConnectedEvent {
+                          subject {
+                            ... on PullRequest {
+                              number
+                              url
+                              state
+                              isCrossRepository
+                              headRefName
+                              createdAt
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const ISSUE_LINKED_PRS_QUERY_LIMIT = 50;
+
+            const toIssueLinkedPullRequest = (node) => {
+              if (!node || typeof node !== "object") {
+                return null;
+              }
+              if (typeof node.number !== "number") {
+                return null;
+              }
+              return {
+                number: node.number,
+                url: typeof node.url === "string" ? node.url : "",
+                state: typeof node.state === "string" ? node.state : "",
+                isCrossRepository: node.isCrossRepository === true,
+                headRefName:
+                  typeof node.headRefName === "string"
+                    ? node.headRefName.trim()
+                    : "",
+                createdAt:
+                  typeof node.createdAt === "string" ? node.createdAt : "",
+              };
+            };
+
+            const toTimestamp = (createdAt) => {
+              const timestamp = Date.parse(createdAt);
+              return Number.isFinite(timestamp) ? timestamp : -1;
+            };
+
+            const compareIssueLinkedPullRequests = (left, right) => {
+              const createdAtDiff =
+                toTimestamp(left.createdAt) - toTimestamp(right.createdAt);
+              if (createdAtDiff !== 0) {
+                return createdAtDiff;
+              }
+              return left.number - right.number;
+            };
+
+            const selectActiveIssueLinkedPullRequest = (issueNode) => {
+              if (!issueNode) {
+                return null;
+              }
+
+              const byNumber = new Map();
+              const appendCandidate = (candidate) => {
+                if (!candidate) {
+                  return;
+                }
+                if (!byNumber.has(candidate.number)) {
+                  byNumber.set(candidate.number, candidate);
+                }
+              };
+
+              const closedByNodes =
+                issueNode.closedByPullRequestsReferences?.nodes || [];
+              for (const node of closedByNodes) {
+                appendCandidate(toIssueLinkedPullRequest(node));
+              }
+
+              const timelineNodes = issueNode.timelineItems?.nodes || [];
+              for (const timelineNode of timelineNodes) {
+                if (!timelineNode) {
+                  continue;
+                }
+                if (timelineNode.__typename === "CrossReferencedEvent") {
+                  appendCandidate(toIssueLinkedPullRequest(timelineNode.source));
+                  continue;
+                }
+                if (timelineNode.__typename === "ConnectedEvent") {
+                  appendCandidate(toIssueLinkedPullRequest(timelineNode.subject));
+                }
+              }
+
+              let activeCandidate = null;
+              for (const candidate of byNumber.values()) {
+                const isSafeCandidate =
+                  candidate.state === "OPEN" &&
+                  candidate.isCrossRepository === false &&
+                  candidate.headRefName.length > 0;
+                if (!isSafeCandidate) {
+                  continue;
+                }
+
+                if (
+                  !activeCandidate ||
+                  compareIssueLinkedPullRequests(candidate, activeCandidate) > 0
+                ) {
+                  activeCandidate = candidate;
+                }
+              }
+
+              return activeCandidate;
+            };
+
+            const resolveIssueLinkedPullRequest = async ({
+              github,
+              owner,
+              repo,
+              issueNumber,
+            }) => {
+              const response = await github.graphql(ISSUE_LINKED_PRS_QUERY, {
+                owner,
+                repo,
+                issueNumber,
+                linkedPrQueryLimit: ISSUE_LINKED_PRS_QUERY_LIMIT,
+              });
+              const issueNode = response?.repository?.issue || null;
+              return selectActiveIssueLinkedPullRequest(issueNode);
+            };
+
+            let branch = null;
+            let activePrNumber = "";
+            let activePrUrl = "";
+
+            if (
+              context.eventName === "pull_request_review_comment" ||
+              context.eventName === "pull_request_review"
+            ) {
+              branch = context.payload.pull_request?.head?.ref || null;
+              activePrNumber = String(context.payload.pull_request?.number || "");
+              activePrUrl = context.payload.pull_request?.html_url || "";
+            } else if (context.eventName === "issue_comment") {
+              if (context.payload.issue?.pull_request) {
+                const pr = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.payload.issue.number,
+                });
+                branch = pr.data.head.ref;
+                activePrNumber = String(pr.data.number || "");
+                activePrUrl = pr.data.html_url || "";
+              } else {
+                const issueNumber = context.payload.issue?.number;
+                if (typeof issueNumber === "number") {
+                  try {
+                    const linkedPullRequest = await resolveIssueLinkedPullRequest({
+                      github,
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issueNumber,
+                    });
+                    if (linkedPullRequest) {
+                      branch = linkedPullRequest.headRefName;
+                      activePrNumber = String(linkedPullRequest.number);
+                      activePrUrl = linkedPullRequest.url;
+                    }
+                  } catch (error) {
+                    core.warning(
+                      `Linked PR branch resolution failed for issue #${issueNumber}: ${error.message}`
+                    );
+                  }
+                }
+                if (!branch) {
+                  branch = context.payload.repository?.default_branch || null;
+                }
+              }
+            } else {
+              branch = context.payload.repository?.default_branch || null;
+            }
+
+            if (!branch) {
+              const repo = await github.rest.repos.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              branch = repo.data.default_branch;
+            }
+
+            core.setOutput("branch", branch);
+            core.setOutput("active_pr_number", activePrNumber);
+            core.setOutput("active_pr_url", activePrUrl);
+
+            const activePrDisplay = activePrNumber
+              ? `#${activePrNumber}${activePrUrl ? ` (${activePrUrl})` : ""}`
+              : "none";
+            core.info(`🔍 Target branch: ${branch} (active PR: ${activePrDisplay})`);
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CODEX_GITHUB_APP_ID }}
+          private-key: ${{ secrets.CODEX_GITHUB_APP_PRIVATE_KEY }}
+
+      - name: Checkout target branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          workspace="${GITHUB_WORKSPACE}"
+          branch="${{ steps.branch.outputs.branch }}"
+          token="${{ steps.app-token.outputs.token }}"
+          repo_slug="${GITHUB_REPOSITORY}"
+          repo_no_auth="https://github.com/${repo_slug}.git"
+
+          if [ -z "$branch" ]; then
+            echo "::error::Target branch is empty."
+            exit 1
+          fi
+
+          if [ -z "$token" ]; then
+            echo "::error::GitHub App token is empty. Check CODEX_GITHUB_APP_ID / CODEX_GITHUB_APP_PRIVATE_KEY secrets."
+            exit 1
+          fi
+
+          # Authenticate git without persisting tokens in the workspace.
+          # - Keep `origin` as a non-auth URL.
+          # - Provide auth via an ephemeral `http.https://github.com/.extraheader` injected with env vars.
+          token_b64="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
+          extraheader="AUTHORIZATION: basic ${token_b64}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="$extraheader"
+          {
+            echo "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT"
+            echo "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0"
+            echo "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0"
+          } >> "$GITHUB_ENV"
+
+          echo "Checking out ${repo_no_auth} @ ${branch}"
+
+          if command -v curl >/dev/null 2>&1; then
+            api_url="https://api.github.com/repos/${repo_slug}"
+            http_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${token}" -H "X-GitHub-Api-Version: 2022-11-28" "${api_url}" || true)"
+            if [ -z "${http_code}" ] || [ "${http_code}" = "000" ]; then
+              echo "::warning::Unable to verify GitHub API access (HTTP ${http_code}); proceeding with git checkout."
+            elif [ "${http_code}" = "401" ] || [ "${http_code}" = "404" ]; then
+              echo "::error::GitHub App token cannot access ${api_url} (HTTP ${http_code}). Ensure the GitHub App is installed on this repo and has 'Contents' permission."
+              exit 1
+            elif [ "${http_code}" != "200" ]; then
+              echo "::warning::GitHub API returned HTTP ${http_code} for ${api_url}; proceeding with git checkout."
+            fi
+          fi
+
+          if [ -d "$workspace" ] && [ -n "$(ls -A "$workspace")" ] && [ ! -d "$workspace/.git" ]; then
+            echo "::error::Workspace is non-empty but not a git repo."
+            echo "::error::Refusing to continue to avoid partial state."
+            echo "Contents of $workspace:"
+            ls -la "$workspace"
+            exit 1
+          fi
+
+          mkdir -p "$workspace"
+
+          if [ ! -d "$workspace/.git" ]; then
+            echo "Workspace missing .git; cloning $repo_no_auth into $workspace"
+            git clone "$repo_no_auth" "$workspace"
+          fi
+
+          git config --global --add safe.directory "$workspace"
+
+          cd "$workspace"
+          if git config --local --get-all http.https://github.com/.extraheader >/dev/null 2>&1; then
+            echo "Clearing persisted GitHub auth headers from local repo config"
+            git config --local --unset-all http.https://github.com/.extraheader || true
+          fi
+          if git remote get-url origin >/dev/null 2>&1; then
+            origin_url="$(git remote get-url origin || true)"
+            if printf '%s' "$origin_url" | grep -q 'x-access-token:'; then
+              echo "Detected tokenized origin URL from a previous run; resetting to non-auth URL."
+            fi
+            git remote set-url origin "$repo_no_auth"
+          else
+            echo "Remote 'origin' missing; adding it."
+            git remote add origin "$repo_no_auth"
+          fi
+          # Self-hosted runners can reuse the same workspace between jobs.
+          # Clean first so branch checkout can't fail with "local changes would be overwritten".
+          git reset --hard HEAD
+          git clean -df
+          set +e
+          fetch_status=0
+          for attempt in 1 2 3; do
+            git fetch --prune origin
+            fetch_status=$?
+            if [ $fetch_status -eq 0 ]; then
+              break
+            fi
+            echo "git fetch failed (attempt ${attempt}/3, exit ${fetch_status}); retrying..."
+            sleep $((attempt * 2))
+          done
+          set -e
+          if [ $fetch_status -ne 0 ]; then
+            echo "::error::git fetch failed for ${repo_no_auth} (exit ${fetch_status}). If the log shows 'Repository not found', the token likely lacks access."
+            exit $fetch_status
+          fi
+
+          if ! git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            echo "::error::Remote branch origin/$branch not found in ${repo_no_auth}"
+            exit 1
+          fi
+          git checkout -f -B "$branch" "origin/$branch"
+          git reset --hard "origin/$branch"
+          git clean -df
+
+      - name: Configure git identity
+        shell: bash
+        env:
+          CODEX_GIT_USER_NAME: ${{ vars.CODEX_GIT_USER_NAME }}
+          CODEX_GIT_USER_EMAIL: ${{ vars.CODEX_GIT_USER_EMAIL }}
+        run: |
+          set -euo pipefail
+
+          cd "${GITHUB_WORKSPACE}"
+          git config user.name "${CODEX_GIT_USER_NAME:-${GITHUB_ACTOR}}"
+          git config user.email "${CODEX_GIT_USER_EMAIL:-${GITHUB_ACTOR}@users.noreply.github.com}"
+
+      - name: Install dependencies (best effort)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "${GITHUB_WORKSPACE}"
+
+          if [ -f package-lock.json ]; then
+            npm ci
+            exit 0
+          fi
+
+          if [ -f yarn.lock ]; then
+            if command -v corepack >/dev/null 2>&1; then
+              corepack enable
+            fi
+            if command -v yarn >/dev/null 2>&1; then
+              yarn install --frozen-lockfile
+            else
+              echo "yarn.lock detected but yarn not available; skipping dependency install."
+            fi
+            exit 0
+          fi
+
+          if [ -f pnpm-lock.yaml ]; then
+            if command -v corepack >/dev/null 2>&1; then
+              corepack enable
+            fi
+            if command -v pnpm >/dev/null 2>&1; then
+              pnpm install --frozen-lockfile
+            else
+              echo "pnpm-lock.yaml detected but pnpm not available; skipping dependency install."
+            fi
+            exit 0
+          fi
+
+          echo "No lockfile detected; skipping dependency install."
+
+      - name: Locate Codex executable
+        id: exes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f ~/.local/bin/codex ]; then
+            CODEX_PATH=~/.local/bin/codex
+          elif [ -f /opt/homebrew/bin/codex ]; then
+            CODEX_PATH=/opt/homebrew/bin/codex
+          elif command -v codex &> /dev/null; then
+            CODEX_PATH=$(command -v codex)
+          else
+            echo "ERROR: codex not found"
+            exit 1
+          fi
+
+          echo "codex_path=$CODEX_PATH" >> $GITHUB_OUTPUT
+          echo "✓ Found codex: $CODEX_PATH"
+
+      - name: Fetch latest comments
+        id: comments
+        uses: actions/github-script@v7
+        env:
+          ACTIVE_PR_NUMBER: ${{ steps.branch.outputs.active_pr_number }}
+          ACTIVE_PR_URL: ${{ steps.branch.outputs.active_pr_url }}
+        with:
+          script: |
+            const eventName = context.eventName;
+
+            const resolvePrimaryContext = () => {
+              if (eventName === 'issue_comment' || eventName === 'issues') {
+                const issue = context.payload.issue || {};
+                return {
+                  number: issue.number,
+                  type: issue.pull_request ? 'pull_request' : 'issue',
+                  url: typeof issue.html_url === 'string' ? issue.html_url : ''
+                };
+              }
+
+              const pullRequest = context.payload.pull_request || {};
+              return {
+                number: pullRequest.number,
+                type: 'pull_request',
+                url: typeof pullRequest.html_url === 'string' ? pullRequest.html_url : ''
+              };
+            };
+
+            const primaryContext = resolvePrimaryContext();
+
+            if (!primaryContext.number) {
+              core.setOutput('comments_text', '');
+              return;
+            }
+
+            const stripCodexHiddenBlocks = (text) => {
+              if (!text) return '';
+              return String(text)
+                .replace(/<!--\s*CODEX_MEMORY_START[\s\S]*?CODEX_MEMORY_END\s*-->\s*/g, '')
+                .replace(/<!--\s*CODEX_DESCRIPTION_START[\s\S]*?CODEX_DESCRIPTION_END\s*-->\s*/g, '')
+                .trim();
+            };
+
+            const PULL_REQUEST_LINKED_ISSUES_QUERY_LIMIT = 50;
+
+            const PULL_REQUEST_LINKED_ISSUES_QUERY = `
+              query ResolvePullRequestLinkedIssues(
+                $owner: String!
+                $repo: String!
+                $pullNumber: Int!
+                $linkedIssueQueryLimit: Int!
+              ) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pullNumber) {
+                    closingIssuesReferences(last: $linkedIssueQueryLimit) {
+                      nodes {
+                        number
+                        url
+                        state
+                        createdAt
+                        repository {
+                          nameWithOwner
+                        }
+                      }
+                    }
+                    timelineItems(
+                      last: $linkedIssueQueryLimit
+                      itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]
+                    ) {
+                      nodes {
+                        __typename
+                        ... on CrossReferencedEvent {
+                          source {
+                            ... on Issue {
+                              number
+                              url
+                              state
+                              createdAt
+                              repository {
+                                nameWithOwner
+                              }
+                            }
+                          }
+                        }
+                        ... on ConnectedEvent {
+                          subject {
+                            ... on Issue {
+                              number
+                              url
+                              state
+                              createdAt
+                              repository {
+                                nameWithOwner
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const OPEN_STATE = 'OPEN';
+
+            const toPullRequestLinkedIssue = (node) => {
+              if (!node || typeof node !== 'object') {
+                return null;
+              }
+              if (typeof node.number !== 'number') {
+                return null;
+              }
+
+              return {
+                number: node.number,
+                url: typeof node.url === 'string' ? node.url : '',
+                state: typeof node.state === 'string' ? node.state : '',
+                createdAt: typeof node.createdAt === 'string' ? node.createdAt : '',
+                repositoryNameWithOwner:
+                  typeof node.repository?.nameWithOwner === 'string'
+                    ? node.repository.nameWithOwner
+                    : '',
+              };
+            };
+
+            const collectPullRequestLinkedIssues = (pullRequestNode) => {
+              if (!pullRequestNode) {
+                return [];
+              }
+
+              const byKey = new Map();
+              const appendCandidate = (candidate) => {
+                if (!candidate) {
+                  return;
+                }
+
+                const key = candidate.repositoryNameWithOwner
+                  ? `${candidate.repositoryNameWithOwner}#${candidate.number}`
+                  : `#${candidate.number}`;
+                if (!byKey.has(key)) {
+                  byKey.set(key, candidate);
+                }
+              };
+
+              const closingNodes = pullRequestNode.closingIssuesReferences?.nodes ?? [];
+              for (const node of closingNodes) {
+                appendCandidate(toPullRequestLinkedIssue(node));
+              }
+
+              const timelineNodes = pullRequestNode.timelineItems?.nodes ?? [];
+              for (const timelineNode of timelineNodes) {
+                if (!timelineNode) {
+                  continue;
+                }
+
+                if (timelineNode.__typename === 'CrossReferencedEvent') {
+                  appendCandidate(toPullRequestLinkedIssue(timelineNode.source));
+                  continue;
+                }
+
+                if (timelineNode.__typename === 'ConnectedEvent') {
+                  appendCandidate(toPullRequestLinkedIssue(timelineNode.subject));
+                }
+              }
+
+              return [...byKey.values()];
+            };
+
+            const isSafePullRequestLinkedIssue = (candidate, repoSlug) => {
+              if (!candidate) {
+                return false;
+              }
+
+              if (candidate.repositoryNameWithOwner !== repoSlug) {
+                return false;
+              }
+
+              return candidate.state === OPEN_STATE;
+            };
+
+            const toTimestamp = (createdAt) => {
+              const timestamp = Date.parse(createdAt);
+              return Number.isFinite(timestamp) ? timestamp : -1;
+            };
+
+            const sortPullRequestLinkedIssues = (left, right) => {
+              const createdAtDiff = toTimestamp(left.createdAt) - toTimestamp(right.createdAt);
+              if (createdAtDiff !== 0) {
+                return createdAtDiff;
+              }
+              return left.number - right.number;
+            };
+
+            const selectActivePullRequestLinkedIssue = (candidates, repoSlug) => {
+              if (!Array.isArray(candidates) || candidates.length === 0) {
+                return null;
+              }
+
+              let activeCandidate = null;
+              for (const candidate of candidates) {
+                if (!isSafePullRequestLinkedIssue(candidate, repoSlug)) {
+                  continue;
+                }
+
+                if (
+                  !activeCandidate ||
+                  sortPullRequestLinkedIssues(candidate, activeCandidate) > 0
+                ) {
+                  activeCandidate = candidate;
+                }
+              }
+
+              return activeCandidate;
+            };
+
+            const resolvePullRequestLinkedIssue = async ({
+              github,
+              owner,
+              repo,
+              pullNumber,
+            }) => {
+              const response = await github.graphql(PULL_REQUEST_LINKED_ISSUES_QUERY, {
+                owner,
+                repo,
+                pullNumber,
+                linkedIssueQueryLimit: PULL_REQUEST_LINKED_ISSUES_QUERY_LIMIT,
+              });
+
+              const pullRequestNode = response?.repository?.pullRequest ?? null;
+              const candidates = collectPullRequestLinkedIssues(pullRequestNode);
+              return selectActivePullRequestLinkedIssue(candidates, `${owner}/${repo}`);
+            };
+
+            const MAX_OLDER_COMMENTS = 28;
+            const MAX_NEWEST_COMMENTS = 2;
+            const OLDER_COMMENT_CHAR_LIMIT = 10000;
+
+            const truncate = (text, maxChars) => {
+              if (!text) return '';
+              const normalized = String(text);
+              if (normalized.length <= maxChars) return normalized;
+              return normalized.slice(0, maxChars) + '...';
+            };
+
+            const fetchIssueComments = async (issueNumber) =>
+              github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                per_page: 100
+              });
+
+            const formatComments = (comments) => {
+              const sorted = [...comments].sort(
+                (a, b) => new Date(a.created_at) - new Date(b.created_at)
+              );
+
+              const selected = sorted.slice(
+                -(MAX_OLDER_COMMENTS + MAX_NEWEST_COMMENTS)
+              );
+
+              const newestComments = selected.slice(-MAX_NEWEST_COMMENTS);
+              const newestCommentIds = new Set(newestComments.map((c) => c.id));
+
+              const formatted = selected.map((comment, index) => {
+                const authorLogin = comment.user?.login || "";
+                const previousCommentBody =
+                  index > 0
+                    ? stripCodexHiddenBlocks(selected[index - 1]?.body || "")
+                    : "";
+                const author = authorLogin;
+                const cleanedBody = stripCodexHiddenBlocks(comment.body || "");
+                const body = newestCommentIds.has(comment.id)
+                  ? cleanedBody
+                  : truncate(cleanedBody, OLDER_COMMENT_CHAR_LIMIT);
+                return `${author}\n${body}`;
+              });
+
+              return formatted.join("\n\n---\n\n");
+            };
+
+            const formatContextLabel = ({ type, number, url }) => {
+              const label = type === 'pull_request' ? 'PR' : 'Issue';
+              const urlSuffix = url ? ` (${url})` : '';
+              return `${label} #${number}${urlSuffix}`;
+            };
+
+            const formatThreadCommentsSection = (threadContext, comments) => {
+              const heading =
+                threadContext.type === 'pull_request'
+                  ? "PR's latest comments"
+                  : "Issue's latest comments";
+              const contextLabel = formatContextLabel(threadContext);
+              const formattedComments = formatComments(comments);
+              if (!formattedComments) {
+                return `${heading}: ${contextLabel}\n(no comments)`;
+              }
+              return `${heading}: ${contextLabel}\n${formattedComments}`;
+            };
+
+            let linkedContext = null;
+            if (primaryContext.type === 'issue') {
+              const activePrNumber = Number.parseInt(
+                process.env.ACTIVE_PR_NUMBER || '',
+                10
+              );
+              if (Number.isFinite(activePrNumber) && activePrNumber > 0) {
+                linkedContext = {
+                  type: 'pull_request',
+                  number: activePrNumber,
+                  url: (process.env.ACTIVE_PR_URL || '').trim(),
+                };
+              }
+            } else {
+              try {
+                const linkedIssue = await resolvePullRequestLinkedIssue({
+                  github,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pullNumber: primaryContext.number,
+                });
+                if (linkedIssue) {
+                  linkedContext = {
+                    type: 'issue',
+                    number: linkedIssue.number,
+                    url: linkedIssue.url,
+                  };
+                }
+              } catch (error) {
+                core.warning(
+                  `Linked issue resolution failed for PR #${primaryContext.number}: ${error.message}`
+                );
+              }
+            }
+
+            core.info(`🧩 Thread context: ${formatContextLabel(primaryContext)}`);
+            core.info(
+              `🧩 Linked context: ${
+                linkedContext ? formatContextLabel(linkedContext) : 'none'
+              }`
+            );
+            core.info(
+              '🧩 Prompt order: linked context first (if any), thread context last'
+            );
+
+            const sections = [];
+            if (
+              linkedContext &&
+              linkedContext.number &&
+              linkedContext.number !== primaryContext.number
+            ) {
+              const linkedComments = await fetchIssueComments(
+                linkedContext.number
+              );
+              sections.push(
+                formatThreadCommentsSection(linkedContext, linkedComments)
+              );
+            }
+
+            const primaryComments = await fetchIssueComments(primaryContext.number);
+            sections.push(formatThreadCommentsSection(primaryContext, primaryComments));
+
+            core.setOutput('comments_text', sections.join("\n\n---\n\n"));
+
+      - name: Fetch issue/PR details
+        id: details
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let issueNumber = null;
+            if (context.eventName === 'issue_comment' || context.eventName === 'issues') {
+              issueNumber = context.payload.issue.number;
+            } else {
+              issueNumber = context.payload.pull_request.number;
+            }
+
+            if (!issueNumber) {
+              core.setOutput('issue_title', '');
+              core.setOutput('issue_body', '');
+              return;
+            }
+
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+
+            core.setOutput('issue_title', issue.data.title || '');
+            core.setOutput('issue_body', issue.data.body || '');
+
+      - name: Log trigger resolution
+        env:
+          TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
+          RUNNER_GROUP: ${{ inputs.runner_group }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          event_path = os.environ["GITHUB_EVENT_PATH"]
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          trigger_phrase = os.environ.get("TRIGGER_PHRASE", "@codex")
+          runner_group = os.environ.get("RUNNER_GROUP", "")
+          canary_phrase = f"{trigger_phrase}-canary"
+
+          with open(event_path, "r", encoding="utf-8") as handle:
+            event = json.load(handle)
+
+          source_field = ""
+          raw_text = ""
+          if event_name in ("issue_comment", "pull_request_review_comment"):
+            source_field = "comment.body"
+            raw_text = ((event.get("comment", {}) or {}).get("body", "")) or ""
+          elif event_name == "pull_request_review":
+            source_field = "review.body"
+            raw_text = ((event.get("review", {}) or {}).get("body", "")) or ""
+          elif event_name == "issues":
+            issue = event.get("issue", {}) or {}
+            if issue.get("body"):
+              source_field = "issue.body"
+              raw_text = issue.get("body", "") or ""
+            else:
+              source_field = "issue.title"
+              raw_text = issue.get("title", "") or ""
+          else:
+            source_field = "unsupported"
+            raw_text = ""
+
+          first_non_empty_line = ""
+          for line in str(raw_text).splitlines():
+            trimmed = line.strip()
+            if trimmed:
+              first_non_empty_line = trimmed
+              break
+
+          line_lower = first_non_empty_line.lower()
+          matched_trigger = "none"
+          canary_pattern = re.compile(rf"^{re.escape(canary_phrase.lower())}(?:\b|$)")
+          trigger_pattern = re.compile(rf"^{re.escape(trigger_phrase.lower())}(?:\b|$)")
+          if canary_pattern.match(line_lower):
+            matched_trigger = canary_phrase
+          elif trigger_pattern.match(line_lower):
+            matched_trigger = trigger_phrase
+
+          print(f"Trigger debug: event_type={event_name}")
+          print(f"Trigger debug: source_field={source_field}")
+          print(f"Trigger debug: first_non_empty_line={first_non_empty_line!r}")
+          print(f"Trigger debug: matched_trigger={matched_trigger}")
+          print(f"Trigger debug: selected_runner_group={runner_group}")
+          PY
+
+      - name: Build Codex prompt
+        id: prompt
+        env:
+          TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
+          TARGET_BRANCH: ${{ steps.branch.outputs.branch }}
+          ACTIVE_PR_NUMBER: ${{ steps.branch.outputs.active_pr_number }}
+          ACTIVE_PR_URL: ${{ steps.branch.outputs.active_pr_url }}
+          COMMENTS_TEXT: ${{ steps.comments.outputs.comments_text }}
+          ISSUE_TITLE: ${{ steps.details.outputs.issue_title }}
+          ISSUE_BODY: ${{ steps.details.outputs.issue_body }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import textwrap
+          from pathlib import Path
+
+          event_path = os.environ["GITHUB_EVENT_PATH"]
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          trigger_phrase = os.environ.get("TRIGGER_PHRASE", "@codex")
+          target_branch = os.environ.get("TARGET_BRANCH", "")
+          active_pr_number = os.environ.get("ACTIVE_PR_NUMBER", "").strip()
+          active_pr_url = os.environ.get("ACTIVE_PR_URL", "").strip()
+          workspace = os.environ.get("GITHUB_WORKSPACE", "")
+          issue_title_from_api = os.environ.get("ISSUE_TITLE", "").strip()
+          issue_body_from_api = os.environ.get("ISSUE_BODY", "").strip()
+
+          with open(event_path, "r", encoding="utf-8") as handle:
+            event = json.load(handle)
+
+          context_url = ""
+          issue_title = ""
+          issue_url = ""
+          issue_number = ""
+          pr_url = ""
+          is_pr_context = False
+
+          if event_name == "issue_comment":
+            context_url = event.get("comment", {}).get("html_url", "")
+            issue = event.get("issue", {})
+            issue_url = issue.get("html_url", "")
+            issue_number = issue.get("number", "")
+            is_pr_context = "pull_request" in issue
+          elif event_name == "pull_request_review_comment":
+            context_url = event.get("comment", {}).get("html_url", "")
+            pr = event.get("pull_request", {})
+            pr_url = pr.get("html_url", "")
+            issue_number = pr.get("number", "")
+            is_pr_context = True
+          elif event_name == "pull_request_review":
+            context_url = event.get("review", {}).get("html_url", "")
+            pr = event.get("pull_request", {})
+            pr_url = pr.get("html_url", "")
+            issue_number = pr.get("number", "")
+            is_pr_context = True
+          elif event_name == "issues":
+            issue = event.get("issue", {})
+            issue_url = issue.get("html_url", "")
+            issue_number = issue.get("number", "")
+
+          if issue_title_from_api:
+            issue_title = issue_title_from_api
+
+          issue_number_display = issue_number or "<number>"
+          comments_text = os.environ.get("COMMENTS_TEXT", "").strip()
+          issue_body_text = issue_body_from_api or ""
+          if issue_body_text and len(issue_body_text) > 12000:
+            issue_body_text = issue_body_text[:12000] + "\n\n…(truncated)…"
+
+          if active_pr_number and active_pr_url:
+            active_pr_display = f"#{active_pr_number} ({active_pr_url})"
+          elif active_pr_number:
+            active_pr_display = f"#{active_pr_number}"
+          elif active_pr_url:
+            active_pr_display = active_pr_url
+          else:
+            active_pr_display = "none"
+
+          trigger_login = ""
+          if event_name in ("issue_comment", "pull_request_review_comment"):
+            trigger_login = (
+              (event.get("comment", {}).get("user", {}) or {}).get("login", "")
+            )
+          elif event_name == "pull_request_review":
+            trigger_login = (
+              (event.get("review", {}).get("user", {}) or {}).get("login", "")
+            )
+          elif event_name == "issues":
+            trigger_login = (
+              (event.get("issue", {}).get("user", {}) or {}).get("login", "")
+            )
+
+          chat_instructions = textwrap.dedent(
+            f"""\
+            * I use voice dictation; expect typos and confirm if ambiguous.
+            * Don't guess & assume. If you're not sure what I mean, ask me.
+            * Instead of guessing the root cause of an issue, suggest adding debug logs.
+            * If implementation intent is unclear, ask a clarifying question instead of editing.
+            * You can update issue's description using gh. Do so as needed.
+            * Do not make changes to the code. You can chat and analyze the code, GitHub, and workflows.
+            """
+          ).strip()
+
+          codex_instructions = textwrap.dedent(
+            f"""\
+            * I use voice dictation; expect typos and confirm if ambiguous.
+            * Don't guess & assume. If you're not sure what I mean, ask me.
+            * If implementation intent is unclear, ask a clarifying question instead of editing.
+            * Instead of guessing the root cause of an issue, suggest adding debug logs.
+            * Write AAA production quality well-documented & tested code.
+            * Prefer deterministic, pure, functional code, with TDD.
+            * Don't write flakey code that can break easily.
+            * Refactor & reuse as needed to avoid duplicate code.
+            * Commit only files relevant to the task. Do not include unrelated changes.
+            * You can update issue's description using gh. Do so as needed.
+            * Pass real newlines for PR bodies (via --body-file or a heredoc/printf).
+            """
+          ).strip()
+
+          common_instructions = textwrap.dedent(
+            """\
+            * To download attachments, use: `curl -H "Authorization: Bearer $GH_TOKEN" -L "<attachment-url>" -o "<filename>"`. Download one file at a time.
+            """
+          ).strip()
+
+          is_chat = trigger_phrase == "@chat"
+          selected_instruction = chat_instructions if is_chat else codex_instructions
+          assistant_name = "Chat" if is_chat else "Codex"
+          assistant_slug = "chat" if is_chat else "codex"
+
+          issue_instructions = (
+            "* If you made code changes, create a PR (make sure tests pass and link the issue in the PR description). "
+            "* If you made code changes but decide not to create a PR, push your WIP branch and mention its name in your response."
+          )
+          pr_instructions = (
+            "* If you made code changes for this PR, commit, run tests, and push your changes to this PR."
+          )
+          change_instructions = pr_instructions if is_pr_context else issue_instructions
+          effective_change_instructions = (change_instructions + "\n\n") if not is_chat else ""
+
+          prompt = (
+            selected_instruction
+            + "\n"
+            + common_instructions
+            + "\n\n"
+            + effective_change_instructions
+            + textwrap.dedent(
+              f"""\
+              * Don't post comments on Github. To respond to the comment, our github workflow will automatically post your response to the Github as a comment.
+              * Use the GitHub CLI (gh) to interact with GitHub (issues, PRs, comments).
+              * You're {trigger_phrase}. You were triggered by GitHub user: {f"@{trigger_login}" if trigger_login else "<unknown>"}.
+              """
+            ).strip()
+            + "\n\n"
+            + textwrap.dedent(f"""\
+            Repo: {repo}
+            Branch: {target_branch}
+            Active PR: {active_pr_display}
+            Workspace: {workspace}
+            URL: {context_url}
+            Title: {issue_title}
+
+            Description:
+            {issue_body_text}
+
+            {comments_text}
+            """).strip()
+            + "\n"
+          )
+
+          output_path = Path(workspace) / ".github" / "codex_prompt.txt"
+          output_path.parent.mkdir(parents=True, exist_ok=True)
+          output_path.write_text(prompt, encoding="utf-8")
+          print(f"prompt_file={output_path}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"prompt_file={output_path}\n")
+            output.write(f"assistant_name={assistant_name}\n")
+            output.write(f"assistant_slug={assistant_slug}\n")
+          PY
+
+      - name: Post Codex start comment
+        id: start_comment
+        uses: actions/github-script@v7
+        env:
+          ASSISTANT_NAME: ${{ steps.prompt.outputs.assistant_name }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CODEX_GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const assistantName = process.env.ASSISTANT_NAME || 'Codex';
+            let issueNumber = null;
+            if (context.eventName === 'issue_comment' || context.eventName === 'issues') {
+              issueNumber = context.payload.issue.number;
+            } else {
+              issueNumber = context.payload.pull_request.number;
+            }
+
+            let jobUrl = null;
+            try {
+              const jobs = await github.rest.actions.listJobsForWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId
+              });
+              const currentJob = jobs.data.jobs.find(job => job.name === context.job);
+              if (currentJob && currentJob.html_url) {
+                jobUrl = currentJob.html_url;
+              }
+            } catch (error) {
+              core.info(`Unable to resolve job URL from API: ${error.message}`);
+            }
+
+            if (!jobUrl) {
+              jobUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            }
+
+            const body = `🤖 [${assistantName} is running...](${jobUrl})`;
+
+            const comment = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body
+            });
+
+            core.setOutput('comment_id', String(comment.data.id));
+            core.setOutput('job_url', jobUrl);
+
+      - name: Run Codex
+        id: codex
+        env:
+          CODEX_PATH: ${{ steps.exes.outputs.codex_path }}
+          PROMPT_FILE: ${{ steps.prompt.outputs.prompt_file }}
+          CODEX_MODEL: ${{ inputs.model }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CODEX_GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$CODEX_PATH" ]; then
+            echo "ERROR: codex path not found"
+            exit 1
+          fi
+          if [ ! -f "$PROMPT_FILE" ]; then
+            echo "ERROR: prompt file not found: $PROMPT_FILE"
+            exit 1
+          fi
+          if [ -z "${CODEX_MODEL:-}" ]; then
+            echo "ERROR: model input is empty"
+            exit 1
+          fi
+
+          TASK="$(cat "$PROMPT_FILE")"
+          OUTPUT_FILE="${{ github.workspace }}/.github/codex_output.txt"
+
+          echo "Using model: ${CODEX_MODEL}"
+          "$CODEX_PATH" exec --model "$CODEX_MODEL" --yolo "$TASK" > "$OUTPUT_FILE"
+          echo "output_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Commit & push WIP changes if Codex failed
+        id: wip_push
+        # When Codex fails (429, token limits, crashes, etc.), preserve any work already applied
+        # to the workspace by committing and pushing it to a new `codex/wip/...` branch.
+        #
+        # Never push directly to the target branch (including `main` and `production`).
+        #
+        # SAFETY:
+        # - Never force-push.
+        if: ${{ always() && steps.codex.outcome == 'failure' }}
+        shell: bash
+        env:
+          ASSISTANT_NAME: ${{ steps.prompt.outputs.assistant_name }}
+          ASSISTANT_SLUG: ${{ steps.prompt.outputs.assistant_slug }}
+          TARGET_BRANCH: ${{ steps.branch.outputs.branch }}
+          CODEX_STEP_OUTCOME: ${{ steps.codex.outcome }}
+          JOB_URL: ${{ steps.start_comment.outputs.job_url }}
+        run: |
+          set -euo pipefail
+
+          cd "${GITHUB_WORKSPACE}"
+
+          head_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+          target_branch="${TARGET_BRANCH:-}"
+          outcome="${CODEX_STEP_OUTCOME:-}"
+          assistant_name="${ASSISTANT_NAME:-Codex}"
+          assistant_slug="${ASSISTANT_SLUG:-codex}"
+          job_url="${JOB_URL:-unknown}"
+          run_id="${GITHUB_RUN_ID:-unknown}"
+          run_attempt="${GITHUB_RUN_ATTEMPT:-0}"
+
+          echo "${assistant_name} outcome: ${outcome}"
+          echo "git HEAD branch: ${head_branch}"
+          echo "Workflow target branch: ${target_branch}"
+
+          # Prefer the actual checked-out branch name; fall back to the workflow-computed target branch.
+          effective_branch="$head_branch"
+          if [ -z "$effective_branch" ] || [ "$effective_branch" = "HEAD" ]; then
+            effective_branch="$target_branch"
+          fi
+
+          if [ -z "$effective_branch" ] || [ "$effective_branch" = "HEAD" ]; then
+            echo "::warning::Unable to determine a branch name; skipping WIP commit/push."
+            exit 0
+          fi
+
+          # Always push to a new branch. This avoids mutating the original branch in failure cases.
+          wip_branch="${assistant_slug}/wip/${effective_branch}/${run_id}-${run_attempt}"
+          if ! git check-ref-format --branch "$wip_branch" >/dev/null 2>&1; then
+            echo "::warning::Generated WIP branch name is invalid: $wip_branch"
+            wip_branch="${assistant_slug}/wip/unknown-branch/${run_id}-${run_attempt}"
+          fi
+
+          wip_branch_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/tree/${wip_branch}"
+          {
+            echo "wip_branch=$wip_branch"
+            echo "wip_branch_url=$wip_branch_url"
+            echo "wip_pushed=false"
+          } >> "$GITHUB_OUTPUT"
+
+          # If there are uncommitted changes, commit them before pushing to the WIP branch.
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            if [ -n "$(git status --porcelain)" ]; then
+              commit_subject="WIP: save ${assistant_name} progress after failure"
+              git commit \
+                -m "$commit_subject" \
+                -m "${assistant_name} outcome: ${outcome}" \
+                -m "Job: ${job_url}"
+            fi
+          fi
+
+          echo "::warning::Pushing WIP to new branch: ${wip_branch}"
+          set +e
+          git push -u origin "HEAD:$wip_branch"
+          push_status=$?
+          set -e
+
+          if [ $push_status -ne 0 ]; then
+            echo "::warning::git push failed (exit ${push_status})"
+            echo "wip_error=git push failed (exit ${push_status})" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "wip_pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Post Codex response
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          CODEX_OUTPUT_FILE: ${{ steps.codex.outputs.output_file }}
+          START_COMMENT_ID: ${{ steps.start_comment.outputs.comment_id }}
+          START_COMMENT_JOB_URL: ${{ steps.start_comment.outputs.job_url }}
+          CODEX_STEP_OUTCOME: ${{ steps.codex.outcome }}
+          CODEX_WIP_BRANCH: ${{ steps.wip_push.outputs.wip_branch }}
+          CODEX_WIP_BRANCH_URL: ${{ steps.wip_push.outputs.wip_branch_url }}
+          CODEX_WIP_PUSHED: ${{ steps.wip_push.outputs.wip_pushed }}
+          CODEX_WIP_ERROR: ${{ steps.wip_push.outputs.wip_error }}
+          JOB_CANCELLED: ${{ job.status == 'cancelled' }}
+          ASSISTANT_NAME: ${{ steps.prompt.outputs.assistant_name }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+            const isCancelled = process.env.JOB_CANCELLED === 'true';
+            const assistantName = process.env.ASSISTANT_NAME || 'Codex';
+            const updateCommentWithRetry = async (params, retries = 2) => {
+              for (let attempt = 0; attempt <= retries; attempt++) {
+                try {
+                  await github.rest.issues.updateComment(params);
+                  return;
+                } catch (error) {
+                  if (attempt === retries) {
+                    throw error;
+                  }
+                  const delay = 1000 * Math.pow(2, attempt);
+                  core.info(`updateComment failed (attempt ${attempt + 1}/${retries + 1}): ${error.message}. Retrying in ${delay}ms.`);
+                  await sleep(delay);
+                }
+              }
+            };
+
+            const commentId = process.env.START_COMMENT_ID;
+            if (!commentId) {
+              if (isCancelled) {
+                core.info('Start comment ID missing on cancellation; nothing to delete.');
+                return;
+              }
+              core.setFailed('Start comment ID not found; cannot update comment.');
+              return;
+            }
+
+            if (isCancelled) {
+              // On cancellation, remove the placeholder "Codex is running..." comment.
+              try {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: Number(commentId)
+                });
+              } catch (error) {
+                core.warning(`Failed to delete start comment on cancellation: ${error.message}`);
+              }
+              return;
+            }
+
+            let jobUrl = process.env.START_COMMENT_JOB_URL;
+            if (!jobUrl) {
+              jobUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            }
+
+            const codexOutcome = process.env.CODEX_STEP_OUTCOME;
+            const wipBranch = process.env.CODEX_WIP_BRANCH;
+            const wipBranchUrl = process.env.CODEX_WIP_BRANCH_URL;
+            const wipPushed = process.env.CODEX_WIP_PUSHED === 'true';
+            const wipError = process.env.CODEX_WIP_ERROR;
+            if (codexOutcome !== 'success') {
+              let body = `❌ ${assistantName} run failed: ${jobUrl}`;
+              if (wipBranch) {
+                if (wipPushed) {
+                  const branchRef = wipBranchUrl ? `[\`${wipBranch}\`](${wipBranchUrl})` : `\`${wipBranch}\``;
+                  body += `\n\n🧷 WIP branch pushed: ${branchRef}\n\nOriginal branch was not modified.`;
+                } else {
+                  body += `\n\n⚠️ WIP branch push attempted but failed: \`${wipBranch}\``;
+                  if (wipError) {
+                    body += `\n${wipError}`;
+                  }
+                }
+              }
+              await updateCommentWithRetry({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: Number(commentId),
+                body
+              });
+              return;
+            }
+
+            const outputFile = process.env.CODEX_OUTPUT_FILE;
+            if (!outputFile || !fs.existsSync(outputFile)) {
+              const body = `❌ ${assistantName} run failed: ${jobUrl}`;
+              await updateCommentWithRetry({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: Number(commentId),
+                body
+              });
+              core.setFailed(`${assistantName} output file not found: ${outputFile}`);
+              return;
+            }
+
+            let output = fs.readFileSync(outputFile, 'utf8');
+            output = output.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+            if (!output.replace(/[ \t\n]+/g, '')) {
+              const body = `❌ ${assistantName} run failed: ${jobUrl}`;
+              await updateCommentWithRetry({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: Number(commentId),
+                body
+              });
+              core.setFailed(`${assistantName} returned empty output.`);
+              return;
+            }
+
+            const stripCodexHiddenBlocks = (text) => {
+              if (!text) return '';
+              return String(text)
+                .replace(/<!--\s*CODEX_MEMORY_START[\s\S]*?CODEX_MEMORY_END\s*-->\s*/g, '')
+                .replace(/<!--\s*CODEX_DESCRIPTION_START[\s\S]*?CODEX_DESCRIPTION_END\s*-->\s*/g, '')
+                .trim();
+            };
+
+            const visibleOutput = stripCodexHiddenBlocks(output);
+            const body = visibleOutput
+              ? `[run](${jobUrl})\n\n${visibleOutput}`
+              : `[run](${jobUrl})\n\n(No public output from ${assistantName}.)`;
+
+              await updateCommentWithRetry({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: Number(commentId),
+                body
+              });
