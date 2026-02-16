@@ -348,6 +348,7 @@ jobs:
           # Runner contract:
           # - git auth must use SSH (`gh auth login --git-protocol ssh` + loaded SSH key)
           # - checkout script forces origin to `git@github.com:<owner>/<repo>.git`
+          # - checkout script bootstraps/refreshes `github.com` known_hosts via `ssh-keyscan`
           # - do not convert this flow back to HTTPS/token-based git remotes
 
           # The shared checkout implementation lives in the reusable workflow repository (this repo).

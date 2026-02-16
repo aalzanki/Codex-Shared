@@ -72,6 +72,26 @@ test("self-hosted-checkout keeps origin on SSH and does not use tokenized HTTPS 
     "Expected checkout script to keep origin configured as SSH."
   );
   assert.ok(
+    script.includes("prepare_github_ssh_known_hosts"),
+    "Expected checkout script to prepare known_hosts for SSH remotes."
+  );
+  assert.ok(
+    script.includes("ssh-keyscan -T 15 -H github.com"),
+    "Expected checkout script to fetch github.com host keys for SSH trust bootstrap."
+  );
+  assert.ok(
+    script.includes("ssh-keygen -R github.com"),
+    "Expected checkout script to refresh stale github.com host keys."
+  );
+  assert.ok(
+    script.includes("StrictHostKeyChecking=yes"),
+    "Expected checkout script to enforce strict SSH host key verification."
+  );
+  assert.ok(
+    script.includes("UserKnownHostsFile="),
+    "Expected checkout script to pin SSH known_hosts path for git operations."
+  );
+  assert.ok(
     script.includes("Clearing legacy GitHub HTTPS auth headers"),
     "Expected checkout script to clean up legacy HTTPS auth headers from older runs."
   );

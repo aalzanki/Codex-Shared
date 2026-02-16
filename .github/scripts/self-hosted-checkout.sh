@@ -22,10 +22,61 @@ is_valid_git_workspace() {
   [ -d "$workspace" ] && git -C "$workspace" rev-parse --is-inside-work-tree >/dev/null 2>&1
 }
 
+prepare_github_ssh_known_hosts() {
+  local home_dir="${HOME:-$workspace}"
+  local ssh_dir="${home_dir}/.ssh"
+  local known_hosts_file="${ssh_dir}/known_hosts"
+  local scan_output=""
+  local scan_status=0
+
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+  touch "$known_hosts_file"
+  chmod 600 "$known_hosts_file"
+
+  if ! command -v ssh-keyscan >/dev/null 2>&1; then
+    echo "::error::ssh-keyscan is not available on this runner; cannot bootstrap github.com SSH host keys."
+    exit 1
+  fi
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "::error::ssh-keygen is not available on this runner; cannot maintain github.com SSH host keys."
+    exit 1
+  fi
+
+  # Refresh github.com host keys each run so fresh runners and rotated host keys both work.
+  ssh-keygen -R github.com -f "$known_hosts_file" >/dev/null 2>&1 || true
+  ssh-keygen -R "[github.com]:22" -f "$known_hosts_file" >/dev/null 2>&1 || true
+
+  set +e
+  for attempt in 1 2 3; do
+    scan_output="$(ssh-keyscan -T 15 -H github.com 2>/dev/null)"
+    scan_status=$?
+    if [ $scan_status -eq 0 ] && [ -n "$scan_output" ]; then
+      break
+    fi
+    echo "ssh-keyscan github.com failed (attempt ${attempt}/3, exit ${scan_status}); retrying..."
+    sleep $((attempt * 2))
+  done
+  set -e
+
+  if [ -z "$scan_output" ]; then
+    echo "::error::Unable to retrieve github.com SSH host keys; cannot safely use SSH remotes."
+    exit 1
+  fi
+
+  printf '%s\n' "$scan_output" >> "$known_hosts_file"
+
+  # Force git/ssh to use the managed known_hosts path with strict host-key checking.
+  export GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=${known_hosts_file} -o StrictHostKeyChecking=yes"
+  echo "Configured SSH trust for github.com in ${known_hosts_file}"
+}
+
 if [ -z "$branch" ]; then
   echo "::error::Target branch is empty."
   exit 1
 fi
+
+prepare_github_ssh_known_hosts
 
 run_git_without_lfs_smudge() {
   git \
