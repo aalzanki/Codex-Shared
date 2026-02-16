@@ -20,6 +20,8 @@ test("codex-shared workflow does not hardcode personal identities or private rep
     "Abdul",
     "AJayQ8",
     "aalzanki",
+    "INTERCOM_ACCESS_TOKEN",
+    "AIRTABLE_TASKS_PAT",
     "default: 'ci-prod'",
     "default: \"ci-prod\"",
   ];
