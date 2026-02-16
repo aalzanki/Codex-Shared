@@ -63,7 +63,6 @@ jobs:
       CODEX_GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
     with:
       trigger_phrase: '@codex'
-      # GitHub Actions runner group name that contains your self-hosted runners.
       runner_group: 'YOUR_RUNNER_GROUP_NAME'
       model: 'gpt-5.2'
 ```
