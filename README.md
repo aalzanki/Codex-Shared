@@ -130,12 +130,6 @@ The workflow also requires a GitHub token secret:
 
 This token is used by the workflow to post/update the final response comment, and it is also embedded into the prompt to let Codex download GitHub attachments from private repos.
 
-Recommended PAT configuration:
-
-| Token type | Recommended setup |
-| --- | --- |
-| Fine-grained PAT | Limit repository access to only the repos using Codex, and grant at least "Issues: Read and write". |
-| Classic PAT | Grant at least the `repo` scope. |
 
 ## Runner Requirements
 
