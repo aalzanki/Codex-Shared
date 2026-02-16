@@ -63,23 +63,8 @@ jobs:
       CODEX_GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
     with:
       trigger_phrase: '@codex'
-      runner_group: >-
-        ${{ (
-          (github.event_name == 'issue_comment' && (
-            github.event.comment.body == '@codex-canary' ||
-            startsWith(github.event.comment.body, '@codex-canary ') ||
-            startsWith(github.event.comment.body, format('@codex-canary{0}', fromJSON('"\n"'))) ||
-            startsWith(github.event.comment.body, format('@codex-canary{0}', fromJSON('"\r\n"')))
-          )) ||
-          (github.event_name == 'issues' && (
-            (github.event.issue.body || '') == '@codex-canary' ||
-            startsWith(github.event.issue.body || '', '@codex-canary ') ||
-            startsWith(github.event.issue.body || '', format('@codex-canary{0}', fromJSON('"\n"'))) ||
-            startsWith(github.event.issue.body || '', format('@codex-canary{0}', fromJSON('"\r\n"'))) ||
-            (github.event.issue.title || '') == '@codex-canary' ||
-            startsWith(github.event.issue.title || '', '@codex-canary ')
-          ))
-        ) && 'ci-canary' || 'ci-prod' }}
+      # GitHub Actions runner group name that contains your self-hosted runners.
+      runner_group: 'YOUR_RUNNER_GROUP_NAME'
       model: 'gpt-5.2'
 ```
 
@@ -87,7 +72,7 @@ Then:
 
 1. Create a GitHub App and install it on the target repo (details below).
 1. Add the required secrets to the target repo (or org-level secrets).
-1. Make sure you have self-hosted runners in the runner groups you reference (for example `ci-prod` and `ci-canary`).
+1. Make sure you have self-hosted runners in the runner group you set in `runner_group`.
 1. Trigger a run by commenting `@codex` (or `@codex-canary`) on an issue/PR, or by opening an issue whose title/body starts with the trigger phrase.
 
 ## GitHub App Setup (Required)
