@@ -136,8 +136,6 @@ This token is used by the workflow to post/update the final response comment, an
 The workflow runs on a self-hosted runner group (`runs-on: group: ...`). Your runner needs:
 
 - `codex` installed and available at `~/.local/bin/codex`, `/opt/homebrew/bin/codex`, or in `PATH`
-- `git`, `bash`, `curl`, and `python3`
-- Any build/test tooling your repo requires (the workflow will best-effort run `npm ci` / `yarn install` / `pnpm install` when a lockfile is present)
 
 ## Optional Repo Variables
 
