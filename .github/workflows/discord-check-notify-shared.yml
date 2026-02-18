@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: "success,failure,cancelled"
+      suppress_notifications:
+        description: "When true, request silent Discord delivery"
+        required: false
+        type: boolean
+        default: false
       trigger_login:
         description: "Preferred GitHub login for channel mapping; defaults to PR author"
         required: false
@@ -325,17 +330,25 @@ jobs:
               : 0;
 
             const iconMap = {
+              started: '⏳',
               success: '✅',
               failure: '❌',
               cancelled: '⚪',
               skipped: '⚪',
+            };
+            const statusLabelMap = {
+              started: 'Started',
+              success: 'Success',
+              failure: 'Failure',
+              cancelled: 'Cancelled',
+              skipped: 'Skipped',
             };
             const workflowName =
               String(process.env.INPUT_SOURCE_WORKFLOW_NAME || '').trim() ||
               context.workflow ||
               'Workflow';
             const icon = iconMap[upstreamResult] || 'ℹ️';
-            const statusLabel = upstreamResult || 'completed';
+            const statusLabel = statusLabelMap[upstreamResult] || 'Completed';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
             let failedJobName = '';
@@ -364,15 +377,21 @@ jobs:
               }
             }
 
-            const messageLines = [`${icon} ${workflowName} ${statusLabel}`];
-            if (failedJobName) {
-              messageLines.push(`Failed job: ${failedJobName}`);
-            }
-            if (failedStepName) {
-              messageLines.push(`Failed step: ${failedStepName}`);
-            }
             const primaryUrl = threadUrl || runUrl;
-            messageLines.push(`Link: ${primaryUrl}`);
+            const messageLines = [];
+            if (upstreamResult === 'started') {
+              messageLines.push('⏳');
+              messageLines.push(primaryUrl);
+            } else {
+              messageLines.push(`${icon} ${statusLabel}`);
+              if (failedJobName) {
+                messageLines.push(`Failed job: ${failedJobName}`);
+              }
+              if (failedStepName) {
+                messageLines.push(`Failed step: ${failedStepName}`);
+              }
+              messageLines.push(primaryUrl);
+            }
 
             core.setOutput('should_notify', shouldNotify ? 'true' : 'false');
             core.setOutput('upstream_result', upstreamResult);
@@ -409,6 +428,7 @@ jobs:
           DISCORD_CHANNEL_ID: ${{ steps.context.outputs.channel_id }}
           DISCORD_CHANNEL_CANDIDATES_JSON: ${{ steps.context.outputs.channel_candidates_json }}
           RESPONSE_TEXT: ${{ steps.context.outputs.response_text }}
+          SUPPRESS_NOTIFICATIONS: ${{ inputs.suppress_notifications }}
           WORKFLOW_NAME: ${{ steps.context.outputs.workflow_name }}
           WORKFLOW_RESULT: ${{ steps.context.outputs.upstream_result }}
           FAILED_JOB_NAME: ${{ steps.context.outputs.failed_job_name }}
@@ -459,6 +479,10 @@ jobs:
             str(os.environ.get("REQUIRE_EXISTING_THREAD", "")).strip().lower()
             in {"1", "true", "yes"}
           )
+          suppress_notifications = (
+            str(os.environ.get("SUPPRESS_NOTIFICATIONS", "")).strip().lower()
+            in {"1", "true", "yes"}
+          )
 
           run_id = os.environ.get("GITHUB_RUN_ID", "")
           run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
@@ -480,6 +504,7 @@ jobs:
             "discord_channel_id": os.environ.get("DISCORD_CHANNEL_ID", ""),
             "discord_channel_candidates": channel_candidates,
             "require_existing_thread": require_existing_thread,
+            "suppress_notifications": suppress_notifications,
             "comment_url": primary_url,
             "job_url": run_url,
             "response_text": os.environ.get("RESPONSE_TEXT", ""),
