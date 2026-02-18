@@ -1534,14 +1534,30 @@ jobs:
               return mapped;
             };
 
+            const unique = (values) => {
+              const seen = new Set();
+              const out = [];
+              for (const value of values) {
+                const normalized = String(value || '').trim();
+                if (!normalized || seen.has(normalized)) {
+                  continue;
+                }
+                seen.add(normalized);
+                out.push(normalized);
+              }
+              return out;
+            };
+
             const channelMap = {
               ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_INPUT || ''),
               ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_SECRET || ''),
             };
+            const channelCandidates = unique(Object.values(channelMap));
 
             const triggerLogin = normalizeLogin(process.env.TRIGGER_LOGIN || '');
             core.setOutput('trigger_login', triggerLogin);
             core.setOutput('channel_id', '');
+            core.setOutput('channel_candidates_json', JSON.stringify(channelCandidates));
             core.setOutput('notify_discord', 'false');
             if (!triggerLogin) {
               core.info('Trigger login missing; Discord prompt mirror disabled.');
@@ -1572,6 +1588,7 @@ jobs:
           BRIDGE_SHARED_SECRET: ${{ secrets.GH_WEBHOOK_SECRET }}
           TRIGGER_LOGIN: ${{ steps.prompt.outputs.trigger_login }}
           DISCORD_CHANNEL_ID: ${{ steps.discord_channel_prompt.outputs.channel_id }}
+          DISCORD_CHANNEL_CANDIDATES_JSON: ${{ steps.discord_channel_prompt.outputs.channel_candidates_json }}
           PAYLOAD_FILE: ${{ runner.temp }}/discord-prompt-bridge-payload.json
           SIGNATURE_FILE: ${{ runner.temp }}/discord-prompt-bridge-signature.txt
           DELIVERY_FILE: ${{ runner.temp }}/discord-prompt-bridge-delivery.txt
@@ -1600,6 +1617,20 @@ jobs:
           thread_url = ""
           source_text = ""
           comment_url = ""
+          channel_candidates = []
+
+          raw_candidates = os.environ.get("DISCORD_CHANNEL_CANDIDATES_JSON", "").strip()
+          if raw_candidates:
+            try:
+              parsed = json.loads(raw_candidates)
+              if isinstance(parsed, list):
+                channel_candidates = [
+                  str(item).strip()
+                  for item in parsed
+                  if str(item).strip()
+                ]
+            except Exception:
+              channel_candidates = []
 
           if event_path:
             try:
@@ -1664,6 +1695,7 @@ jobs:
             "thread_title": thread_title,
             "thread_url": thread_url,
             "discord_channel_id": os.environ.get("DISCORD_CHANNEL_ID", ""),
+            "discord_channel_candidates": channel_candidates,
             "comment_url": comment_url,
             "job_url": f"{os.environ.get('GITHUB_SERVER_URL', '')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}",
             "response_text": source_text,
@@ -2268,14 +2300,30 @@ jobs:
               return mapped;
             };
 
+            const unique = (values) => {
+              const seen = new Set();
+              const out = [];
+              for (const value of values) {
+                const normalized = String(value || '').trim();
+                if (!normalized || seen.has(normalized)) {
+                  continue;
+                }
+                seen.add(normalized);
+                out.push(normalized);
+              }
+              return out;
+            };
+
             const channelMap = {
               ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_INPUT || ''),
               ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_SECRET || ''),
             };
+            const channelCandidates = unique(Object.values(channelMap));
 
             const triggerLogin = normalizeLogin(process.env.TRIGGER_LOGIN || '');
             core.setOutput('trigger_login', triggerLogin);
             core.setOutput('channel_id', '');
+            core.setOutput('channel_candidates_json', JSON.stringify(channelCandidates));
             core.setOutput('notify_discord', 'false');
             if (!triggerLogin) {
               core.info('Trigger login missing; Discord bridge notification disabled.');
@@ -2308,6 +2356,7 @@ jobs:
           ASSISTANT_SLUG: ${{ steps.prompt.outputs.assistant_slug }}
           TRIGGER_LOGIN: ${{ steps.prompt.outputs.trigger_login }}
           DISCORD_CHANNEL_ID: ${{ steps.discord_channel.outputs.channel_id }}
+          DISCORD_CHANNEL_CANDIDATES_JSON: ${{ steps.discord_channel.outputs.channel_candidates_json }}
           COMMENT_URL: ${{ steps.post_response.outputs.comment_url }}
           JOB_URL: ${{ steps.post_response.outputs.job_url }}
           DISCORD_OUTPUT: ${{ steps.post_response.outputs.discord_output }}
@@ -2347,6 +2396,20 @@ jobs:
           issue_type = "unknown"
           thread_title = ""
           thread_url = ""
+          channel_candidates = []
+
+          raw_candidates = os.environ.get("DISCORD_CHANNEL_CANDIDATES_JSON", "").strip()
+          if raw_candidates:
+            try:
+              parsed = json.loads(raw_candidates)
+              if isinstance(parsed, list):
+                channel_candidates = [
+                  str(item).strip()
+                  for item in parsed
+                  if str(item).strip()
+                ]
+            except Exception:
+              channel_candidates = []
           if event_path:
             try:
               with open(event_path, "r", encoding="utf-8") as handle:
@@ -2381,6 +2444,7 @@ jobs:
             "thread_title": thread_title,
             "thread_url": thread_url,
             "discord_channel_id": os.environ.get("DISCORD_CHANNEL_ID", ""),
+            "discord_channel_candidates": channel_candidates,
             "comment_url": os.environ.get("COMMENT_URL", ""),
             "job_url": os.environ.get("JOB_URL", ""),
             "response_text": os.environ.get("DISCORD_OUTPUT", ""),
