@@ -643,6 +643,8 @@ jobs:
           PAYLOAD_FILE: ${{ runner.temp }}/discord-check-bridge-payload.json
           SIGNATURE_FILE: ${{ runner.temp }}/discord-check-bridge-signature.txt
           DELIVERY_FILE: ${{ runner.temp }}/discord-check-bridge-delivery.txt
+          RESPONSE_FILE: ${{ runner.temp }}/discord-check-bridge-response.txt
+          CURL_STDERR_FILE: ${{ runner.temp }}/discord-check-bridge-curl-stderr.txt
         run: |
           set -euo pipefail
 
@@ -660,21 +662,33 @@ jobs:
           delivery_id="$(cat "${DELIVERY_FILE}")"
 
           set +e
-          curl_output="$(
-            curl --fail --silent --show-error \
+          http_code="$(
+            curl --silent --show-error \
               --retry 3 \
               --retry-delay 1 \
+              --output "${RESPONSE_FILE}" \
+              --write-out "%{http_code}" \
               -H "Content-Type: application/json" \
               -H "X-Hub-Signature-256: ${signature}" \
               -H "X-GitHub-Event: codex.bridge" \
               -H "X-GitHub-Delivery: ${delivery_id}" \
               --data-binary @"${PAYLOAD_FILE}" \
-              "${DISCORD_BRIDGE_URL}" 2>&1
+              "${DISCORD_BRIDGE_URL}" 2>"${CURL_STDERR_FILE}"
           )"
           curl_status="$?"
           set -e
 
           if [ "${curl_status}" -ne 0 ]; then
+            curl_output="$(cat "${CURL_STDERR_FILE}" 2>/dev/null || true)"
             echo "::warning::Discord bridge delivery failed (exit ${curl_status}): ${curl_output}"
+            exit 0
+          fi
+
+          if ! [[ "${http_code}" =~ ^[0-9]{3}$ ]] || [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+            response_body="$(cat "${RESPONSE_FILE}" 2>/dev/null || true)"
+            if [ -z "${response_body}" ]; then
+              response_body="<empty response body>"
+            fi
+            echo "::warning::Discord bridge delivery failed (HTTP ${http_code}): ${response_body}"
             exit 0
           fi
