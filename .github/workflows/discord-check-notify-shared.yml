@@ -17,6 +17,11 @@ on:
         required: false
         type: string
         default: ""
+      runner_group:
+        description: "Runner group for notification job"
+        required: false
+        type: string
+        default: "ci-prod"
       upstream_result:
         description: "Result of upstream job(s): success|failure|cancelled|skipped"
         required: true
@@ -74,7 +79,8 @@ on:
 
 jobs:
   notify:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: ${{ inputs.runner_group }}
     permissions:
       actions: read
       contents: read
@@ -418,12 +424,22 @@ jobs:
           signature="$(cat "${SIGNATURE_FILE}")"
           delivery_id="$(cat "${DELIVERY_FILE}")"
 
-          curl --fail --silent --show-error \
-            --retry 3 \
-            --retry-delay 1 \
-            -H "Content-Type: application/json" \
-            -H "X-Hub-Signature-256: ${signature}" \
-            -H "X-GitHub-Event: codex.bridge" \
-            -H "X-GitHub-Delivery: ${delivery_id}" \
-            --data-binary @"${PAYLOAD_FILE}" \
-            "${DISCORD_BRIDGE_URL}"
+          set +e
+          curl_output="$(
+            curl --fail --silent --show-error \
+              --retry 3 \
+              --retry-delay 1 \
+              -H "Content-Type: application/json" \
+              -H "X-Hub-Signature-256: ${signature}" \
+              -H "X-GitHub-Event: codex.bridge" \
+              -H "X-GitHub-Delivery: ${delivery_id}" \
+              --data-binary @"${PAYLOAD_FILE}" \
+              "${DISCORD_BRIDGE_URL}" 2>&1
+          )"
+          curl_status="$?"
+          set -e
+
+          if [ "${curl_status}" -ne 0 ]; then
+            echo "::warning::Discord bridge delivery failed (exit ${curl_status}): ${curl_output}"
+            exit 0
+          fi
