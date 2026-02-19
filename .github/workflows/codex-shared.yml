@@ -2479,6 +2479,8 @@ jobs:
           PAYLOAD_FILE: ${{ runner.temp }}/discord-bridge-payload.json
           SIGNATURE_FILE: ${{ runner.temp }}/discord-bridge-signature.txt
           DELIVERY_FILE: ${{ runner.temp }}/discord-bridge-delivery.txt
+          RESPONSE_FILE: ${{ runner.temp }}/discord-bridge-response.txt
+          CURL_STDERR_FILE: ${{ runner.temp }}/discord-bridge-curl-stderr.txt
         run: |
           set -euo pipefail
 
@@ -2490,15 +2492,56 @@ jobs:
           signature="$(cat "${SIGNATURE_FILE}")"
           delivery_id="$(cat "${DELIVERY_FILE}")"
 
-          curl --fail --silent --show-error \
-            --retry 3 \
-            --retry-delay 1 \
-            -H "Content-Type: application/json" \
-            -H "X-Hub-Signature-256: ${signature}" \
-            -H "X-GitHub-Event: codex.bridge" \
-            -H "X-GitHub-Delivery: ${delivery_id}" \
-            --data-binary @"${PAYLOAD_FILE}" \
-            "${DISCORD_BRIDGE_URL}"
+          max_attempts=6
+          attempt=1
+          curl_status=0
+          http_code=""
+          delivered="false"
+
+          while [ "${attempt}" -le "${max_attempts}" ]; do
+            : > "${RESPONSE_FILE}"
+            : > "${CURL_STDERR_FILE}"
+
+            set +e
+            http_code="$(
+              curl --silent --show-error \
+                --connect-timeout 10 \
+                --max-time 60 \
+                --output "${RESPONSE_FILE}" \
+                --write-out "%{http_code}" \
+                -H "Content-Type: application/json" \
+                -H "X-Hub-Signature-256: ${signature}" \
+                -H "X-GitHub-Event: codex.bridge" \
+                -H "X-GitHub-Delivery: ${delivery_id}" \
+                --data-binary @"${PAYLOAD_FILE}" \
+                "${DISCORD_BRIDGE_URL}" 2>"${CURL_STDERR_FILE}"
+            )"
+            curl_status="$?"
+            set -e
+
+            if [ "${curl_status}" -eq 0 ] && [[ "${http_code}" =~ ^[0-9]{3}$ ]] && [ "${http_code}" -ge 200 ] && [ "${http_code}" -lt 300 ]; then
+              delivered="true"
+              break
+            fi
+
+            if [ "${attempt}" -lt "${max_attempts}" ]; then
+              sleep_seconds="$((attempt * 2))"
+              echo "::notice::Discord bridge delivery retry ${attempt}/${max_attempts} (curl=${curl_status}, http=${http_code:-n/a}) in ${sleep_seconds}s."
+              sleep "${sleep_seconds}"
+            fi
+
+            attempt=$((attempt + 1))
+          done
+
+          if [ "${delivered}" != "true" ]; then
+            curl_output="$(cat "${CURL_STDERR_FILE}" 2>/dev/null || true)"
+            response_body="$(cat "${RESPONSE_FILE}" 2>/dev/null || true)"
+            if [ -z "${response_body}" ]; then
+              response_body="<empty response body>"
+            fi
+            echo "::warning::Discord bridge delivery failed after ${max_attempts} attempts (curl=${curl_status}, http=${http_code:-n/a}, stderr=${curl_output}, body=${response_body})"
+            exit 0
+          fi
 
       - name: Resolve Discord webhook for trigger user
         id: discord_webhook
